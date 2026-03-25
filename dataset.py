@@ -1,165 +1,214 @@
-import os
+"""
+dataset.py — YOLO format dataset loader for RF-DETR training.
 
+Expected directory layout (standard YOLO / Roboflow export):
+    dataset_dir/
+        data.yaml          ← class names + split paths
+        train/
+            images/        ← *.jpg / *.png / *.bmp
+            labels/        ← *.txt (YOLO format: class cx cy w h, normalised)
+        valid/
+            images/
+            labels/
+        test/              ← optional
+            images/
+            labels/
+
+Usage:
+    train_ds, val_ds, class_names = build_datasets(
+        dataset_dir = "/path/to/my_dataset",
+        resolution  = 560,
+    )
+    train_loader = DataLoader(train_ds, batch_size=4, collate_fn=collate_fn, ...)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import random
+import sys
+from typing import List, Tuple
+
+import numpy as np
 import torch
-from PIL import Image
-from torch.utils.data import Dataset
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
+from torch.utils.data import DataLoader
+
+RFDETR_SRC = Path(__file__).resolve().parent.parent / "rf-detr" / "src"
+if RFDETR_SRC.exists() and str(RFDETR_SRC) not in sys.path:
+    sys.path.insert(0, str(RFDETR_SRC))
+
+# RF-DETR dataset utilities
+from rfdetr.datasets.aug_config import (
+    AUG_AERIAL,
+    AUG_AGGRESSIVE,
+    AUG_CONFIG,
+    AUG_CONSERVATIVE,
+    AUG_INDUSTRIAL,
+)
+from rfdetr.datasets.coco import make_coco_transforms
+from rfdetr.datasets.yolo import YoloDetection, is_valid_yolo_dataset
+
+REQUIRED_YAML_FILES = ["data.yaml", "data.yml"]
+
+AUGMENTATION_PRESETS = {
+    "default": AUG_CONFIG,
+    "conservative": AUG_CONSERVATIVE,
+    "aggressive": AUG_AGGRESSIVE,
+    "aerial": AUG_AERIAL,
+    "industrial": AUG_INDUSTRIAL,
+    "none": {},
+}
 
 
-class YOLODetectionDataset(Dataset):
+def _seed_worker(worker_id: int) -> None:
+    """Seed dataloader workers for reproducible augmentation / sampling."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+# ─────────────────────────────── Dataset builder ─────────────────────────────── #
+
+def build_datasets(
+    dataset_dir: str,
+    resolution: int = 560,
+    patch_size: int = 14,
+    num_windows: int = 4,
+    train_aug_config=None,
+) -> Tuple[YoloDetection, YoloDetection, List[str]]:
     """
-    Dataset loader for YOLO-format object detection labels.
+    Build train and validation datasets from a YOLO-format directory.
 
-    YOLO label format per line: <class_id> <cx> <cy> <w> <h>
-    All values are normalized [0, 1] relative to image dimensions.
+    Args:
+        dataset_dir: Root of the YOLO dataset (must contain data.yaml and
+                     train/ + valid/ subdirectories).
+        resolution:  Target square image size in pixels.  Must be divisible by
+                     ``patch_size * num_windows`` (default: 56).
+        patch_size:  DINOv2 patch size — should match the model (default: 14).
+        num_windows: Windowed attention window count (default: 4).
+        train_aug_config: Optional RF-DETR/Albumentations config for the train split.
 
-    This format maps directly to the decoder's output format [cx, cy, w, h]
-    so no coordinate conversion is needed at any point in the pipeline.
-
-    Directory structure expected:
-        img_dir/
-            image1.jpg
-            image2.jpg
-        label_dir/
-            image1.txt
-            image2.txt
-
-    Images without a corresponding label file are silently skipped.
+    Returns:
+        (train_dataset, val_dataset, class_names)
     """
-
-    def __init__(
-        self,
-        img_dir,
-        label_dir,
-        image_size=(476, 630),  # (H, W) — matches DINOv2 ViT-L patch grid
-        augment=False,
-    ):
-        """
-        Args:
-            img_dir:    path to directory of images
-            label_dir:  path to directory of YOLO .txt label files
-            image_size: (H, W) to resize all images to
-            augment:    whether to apply training augmentations
-        """
-        self.img_dir = img_dir
-        self.label_dir = label_dir
-        self.image_size = image_size
-        self.augment = augment
-
-        self.samples = []
-        for fname in sorted(os.listdir(img_dir)):
-            if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
-                continue
-            stem = os.path.splitext(fname)[0]
-            label_path = os.path.join(label_dir, stem + '.txt')
-            if os.path.exists(label_path):
-                self.samples.append((
-                    os.path.join(img_dir, fname),
-                    label_path,
-                ))
-
-        # ImageNet normalization — required for DINOv2 backbone
-        self.normalize = T.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
+    root = Path(dataset_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {root}")
+    if not is_valid_yolo_dataset(str(root)):
+        raise ValueError(
+            f"'{root}' does not look like a valid YOLO dataset.\n"
+            "Expected: data.yaml, train/images/, train/labels/, valid/images/, valid/labels/"
         )
 
-    def __len__(self):
-        return len(self.samples)
-
-    def _load_labels(self, label_path):
-        """
-        Parse a YOLO .txt label file.
-
-        Returns:
-            boxes:  (N, 4) float32 tensor [cx, cy, w, h] normalized
-            labels: (N,)   int64  tensor of class indices (0-indexed)
-        """
-        boxes = []
-        labels = []
-
-        with open(label_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                cls = int(parts[0])
-                cx, cy, w, h = map(float, parts[1:5])
-                labels.append(cls)
-                boxes.append([cx, cy, w, h])
-
-        if len(boxes) == 0:
-            return (
-                torch.zeros((0, 4), dtype=torch.float32),
-                torch.zeros((0,), dtype=torch.int64),
-            )
-
-        return (
-            torch.tensor(boxes, dtype=torch.float32),
-            torch.tensor(labels, dtype=torch.int64),
+    block = patch_size * num_windows
+    if resolution % block != 0:
+        raise ValueError(
+            f"resolution={resolution} must be divisible by patch_size*num_windows={block}. "
+            f"Try {round(resolution / block) * block}."
         )
 
-    def _augment(self, image, boxes):
-        """
-        Simple training augmentations that are safe with normalized box coords.
+    data_file = next(
+        (root / f for f in REQUIRED_YAML_FILES if (root / f).exists()), root / "data.yaml"
+    )
 
-        Only horizontal flip is applied — avoids any augmentation that would
-        require re-normalizing box coordinates (e.g. random crop, rotation).
-        ColorJitter is applied to the image only.
+    train_ds = YoloDetection(
+        img_folder=str(root / "train" / "images"),
+        lb_folder=str(root / "train" / "labels"),
+        data_file=str(data_file),
+        transforms=make_coco_transforms(
+            image_set="train",
+            resolution=resolution,
+            multi_scale=False,           # no random multi-scale, keep it simple
+            skip_random_resize=True,     # resize directly to `resolution`
+            patch_size=patch_size,
+            num_windows=num_windows,
+            aug_config=train_aug_config,
+        ),
+    )
 
-        Args:
-            image: PIL Image
-            boxes: (N, 4) float32 [cx, cy, w, h] normalized
-        Returns:
-            image: PIL Image
-            boxes: (N, 4) float32
-        """
-        # Random horizontal flip
-        if torch.rand(1) > 0.5:
-            image = TF.hflip(image)
-            if boxes.shape[0] > 0:
-                # cx flips to 1 - cx, w unchanged
-                boxes[:, 0] = 1.0 - boxes[:, 0]
+    val_ds = YoloDetection(
+        img_folder=str(root / "valid" / "images"),
+        lb_folder=str(root / "valid" / "labels"),
+        data_file=str(data_file),
+        transforms=make_coco_transforms(
+            image_set="val",
+            resolution=resolution,
+            multi_scale=False,
+            skip_random_resize=True,
+            patch_size=patch_size,
+            num_windows=num_windows,
+        ),
+    )
 
-        # Color jitter — image only, no box changes needed
-        color_jitter = T.ColorJitter(
-            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1
-        )
-        image = color_jitter(image)
+    class_names: List[str] = train_ds.classes
+    return train_ds, val_ds, class_names
 
-        return image, boxes
 
-    def __getitem__(self, idx):
-        img_path, label_path = self.samples[idx]
-
-        image = Image.open(img_path).convert('RGB')
-        image = image.resize(
-            (self.image_size[1], self.image_size[0]),  # PIL takes (W, H)
-            Image.BILINEAR,
-        )
-
-        boxes, labels = self._load_labels(label_path)
-
-        if self.augment:
-            image, boxes = self._augment(image, boxes)
-
-        # To tensor + normalize for DINOv2
-        image = TF.to_tensor(image)
-        image = self.normalize(image)
-
-        return image, {"boxes": boxes, "labels": labels}
-
+# ─────────────────────────────────── Collation ───────────────────────────────── #
 
 def collate_fn(batch):
     """
-    Custom collate for variable-length target lists.
+    Stack images into a single tensor; keep targets as a list of dicts.
 
-    Images are stacked into a single tensor.
-    Targets stay as a list of dicts since each image has a different
-    number of ground truth boxes — cannot be naively batched.
+    RF-DETR's LWDETR.forward accepts either a plain tensor or a NestedTensor.
+    When all images in the batch have the same resolution (which they do after
+    the fixed-size resize transform), stacking into a tensor is fine.
     """
     images, targets = zip(*batch)
-    images = torch.stack(images)       # (B, 3, H, W)
-    return images, list(targets)       # targets: list of B dicts
+    return torch.stack(images), list(targets)
+
+
+def build_loaders(
+    dataset_dir: str,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    resolution: int = 560,
+    pin_memory: bool = True,
+    patch_size: int = 14,
+    num_windows: int = 4,
+    train_aug_config=None,
+    seed: int | None = None,
+) -> Tuple[DataLoader, DataLoader, List[str]]:
+    """
+    Convenience wrapper: builds datasets and loaders in one call.
+
+    Returns:
+        (train_loader, val_loader, class_names)
+    """
+    train_ds, val_ds, class_names = build_datasets(
+        dataset_dir,
+        resolution=resolution,
+        patch_size=patch_size,
+        num_windows=num_windows,
+        train_aug_config=train_aug_config,
+    )
+
+    generator = None
+    worker_init_fn = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        worker_init_fn = _seed_worker
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        drop_last=True,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
+    )
+    return train_loader, val_loader, class_names
